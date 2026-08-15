@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-ai-hardware-daily — 每日 AI 硬件/项目热点抓取
+ai-hardware-daily — 每日「新」智能硬件项目抓取
 
-通过 GitHub Search API 抓取当日最热的 AI 硬件相关仓库，
-生成 Markdown 日报。由 GitHub Actions 每天定时触发。
+聚焦：最近 N 天「新建」的、与物理硬件 + AI/智能 沾边的 GitHub 仓库。
+不是按总 star 排名的老牌大项目，而是刚冒头的新硬件项目。
+
+由 GitHub Actions 每天定时触发。
 """
 
 import requests
@@ -16,27 +18,38 @@ from collections import defaultdict
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "daily")
 
+# 只看过去 N 天新建的仓库
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "7"))
+
+# 每类最多返回多少个（用于 top 筛选）
+PER_QUERY = int(os.environ.get("PER_QUERY", "10"))
+
+# 聚焦「真·智能硬件」的关键词组（每组 ≤5 个 OR 操作符，GitHub Search 硬限制）
+# 分类覆盖：机器人 / 嵌入式开发板 / 消费级智能硬件 / 传感器 / 无人机 / 智能家居 / 可穿戴 / AI 边缘
 SEARCH_QUERIES = [
-    # AI 芯片/硬件加速
-    ("AI Chip / Accelerator", "ai chip OR npu OR tpu OR ai accelerator OR neural engine"),
-    # 边缘 AI / TinyML
-    ("Edge AI / TinyML", "edge ai OR tinyml OR on-device ml OR embedded ai OR microcontroller ml"),
     # 机器人 / 具身智能
-    ("Robotics / Embodied AI", "robot OR embodied ai OR ros2 OR humanoid robot"),
-    # 开源硬件 / RISC-V
-    ("Open Hardware / RISC-V", "open source hardware OR risc-v ai OR fpga ai OR open pcb"),
-    # AI 编译器 / 模型优化
-    ("AI Compiler / Optimization", "ml compiler OR model optimization OR onnx OR tvm OR quantization OR llm inference"),
-    # 无人机 / 自动驾驶
-    ("Drone / Autonomous", "drone OR autonomous vehicle OR ADAS OR flight controller OR lidar slam"),
-    # 传感器融合 / 智能感知
-    ("Smart Sensor / Perception", "smart sensor OR imu sensor OR sensor fusion OR computer vision hardware"),
-    # AI 推理部署
-    ("Inference Deployment", "llm deployment OR vllm OR ollama OR local llm OR inference server"),
-    # 大模型训练/微调工具
-    ("LLM Training / Finetune", "llm finetune OR lora OR qlora OR rlhf OR model training framework"),
-    # AI Agent 框架
-    ("AI Agent Framework", "ai agent framework OR multi agent OR agent orchestration OR tool calling"),
+    ("Robot / Embodied", "robot OR quadruped OR humanoid OR ros2 OR embodied"),
+    # 嵌入式 / 单片机开发（拆两条）
+    ("Embedded / MCU", "esp32 OR stm32 OR arduino OR rp2040 OR nrf52"),
+    ("MCU / Firmware", "microcontroller firmware OR embedded system OR mcu firmware OR realtime embedded"),
+    # 消费级智能硬件
+    ("Consumer HW", "smart speaker OR wearable OR smart watch OR e-ink OR desk gadget"),
+    # 智能家居
+    ("Smart Home", "smart home OR home automation OR esphome OR tasmota OR home assistant"),
+    # 开源 PCB / 硬件设计（收紧，避免 design 语义漂移）
+    ("PCB / KiCad", "kicad OR gerber OR altium library OR pcb design OR open hardware"),
+    # 传感器 / 感知
+    ("Sensor / Perception", "imu OR lidar OR sensor fusion OR mmwave OR tof sensor"),
+    # 无人机 / 运动控制
+    ("Drone / Motion", "drone OR uav OR flight controller OR stepper motor OR gimbal"),
+    # 边缘 AI 推理
+    ("Edge AI", "tinyml OR npu OR edge ai OR ai accelerator OR on-device inference"),
+    # RISC-V / FPGA / 定制芯片
+    ("RISC-V / FPGA", "risc-v OR fpga OR verilog OR chisel OR custom soc"),
+    # IoT 连接 / 网关
+    ("IoT / Gateway", "zigbee OR mqtt OR matter protocol OR iot gateway OR lorawan"),
+    # 3D 打印 / 硬件外壳 / 自造
+    ("Fabrication", "3d print OR enclosure design OR cnc machining OR open source gadget"),
 ]
 
 HEADERS = {
@@ -46,11 +59,11 @@ HEADERS = {
 }
 
 
-def search_repos(query: str, per_page: int = 10) -> list:
-    """搜索 GitHub 仓库，按 stars 排序"""
+def search_new_repos(query: str, created_after: str, per_page: int) -> list:
+    """搜索「最近新建」且与硬件相关的仓库，按 star 排序"""
     url = "https://api.github.com/search/repositories"
     params = {
-        "q": f"{query} sort:stars",
+        "q": f"({query}) created:>{created_after}",
         "sort": "stars",
         "order": "desc",
         "per_page": per_page,
@@ -58,102 +71,107 @@ def search_repos(query: str, per_page: int = 10) -> list:
     try:
         resp = requests.get(url, headers=HEADERS, params=params, timeout=30)
         if resp.status_code == 200:
-            data = resp.json()
-            return data.get("items", [])
+            return resp.json().get("items", [])
+        elif resp.status_code == 403:
+            print(f"  ⚠️ 403 限流: {resp.text[:120]}")
+        elif resp.status_code == 401:
+            print(f"  ⚠️ 401 token 无效")
         else:
             print(f"  ⚠️ API error {resp.status_code}: {resp.text[:100]}")
-            return []
+        return []
     except Exception as e:
         print(f"  ⚠️ Request error: {e}")
         return []
 
 
-def generate_report(all_results: dict, date_str: str) -> str:
-    """生成 Markdown 日报"""
+def fmt_date(s):
+    try:
+        return datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").strftime("%m-%d")
+    except Exception:
+        return "?"
+
+
+def generate_report(results: dict, date_str: str, created_after: str) -> str:
     lines = []
-    lines.append(f"# 🤖🔧 AI 硬件/项目日报 — {date_str}")
+    lines.append(f"# 🤖🔧 每日新智能硬件 — {date_str}")
     lines.append("")
-    lines.append(f"> 自动抓取 · 每日 09:00 UTC | 覆盖 {len(SEARCH_QUERIES)} 个方向")
+    lines.append(f"> 聚焦「最近新建」的硬件项目 · 只看 {LOOKBACK_DAYS} 天内新建 · 每日 09:00 UTC")
     lines.append("")
     lines.append("---")
     lines.append("")
 
-    total_repos = 0
-
-    for category, repos in all_results.items():
+    seen = set()
+    total = 0
+    for category, repos in results.items():
         lines.append(f"## 📂 {category}")
         lines.append("")
         if not repos:
-            lines.append("*今日无新的高星仓库*")
+            lines.append("*本类近 7 天无新硬件仓库*")
             lines.append("")
             continue
-
-        lines.append("| ⭐ Stars | 仓库 | 描述 | 语言 |")
-        lines.append("|---------|------|------|------|")
-        for r in repos[:5]:  # 每类取 top 5
-            total_repos += 1
+        lines.append("| ⭐ | 仓库 | 新建 | 描述 | 语言 |")
+        lines.append("|---|------|------|------|------|")
+        for r in repos:
+            full = r.get("full_name", "?")
+            if full in seen:
+                continue
+            seen.add(full)
+            total += 1
             stars = r.get("stargazers_count", 0)
-            name = f"[{r.get('full_name','?')}]({r.get('html_url','#')})"
-            desc = (r.get("description") or "—")[:80]
+            name = f"[{full}]({r.get('html_url','#')})"
+            created = fmt_date(r.get("created_at", ""))
+            desc = (r.get("description") or "—").replace("|", "\\|")[:70]
             lang = r.get("language") or "—"
-            lines.append(f"| {stars} | {name} | {desc} | {lang} |")
+            lines.append(f"| {stars} | {name} | {created} | {desc} | {lang} |")
         lines.append("")
 
     lines.append("---")
     lines.append("")
-    lines.append(f"📊 本日共收录 **{total_repos}** 个热门仓库")
+    lines.append(f"📊 本日共收录 **{total}** 个新硬件仓库（{LOOKBACK_DAYS} 天内新建，去重后）")
     lines.append("")
     lines.append("*由 [ai-hardware-daily](https://github.com/libiao83/ai-hardware-daily) 自动生成*")
     lines.append("")
-
     return "\n".join(lines)
 
 
-def main():
-    today = datetime.datetime.utcnow()
-    date_str = today.strftime("%Y-%m-%d")
-
-    print(f"🚀 ai-hardware-daily — {date_str}")
-    print(f"{'='*50}")
-
-    all_results = {}
-    for category, query in SEARCH_QUERIES:
-        print(f"🔍 Searching: {category}...")
-        repos = search_repos(query)
-        all_results[category] = repos
-        print(f"   Found {len(repos)} repos")
-
-    # 生成日报
-    report = generate_report(all_results, date_str)
-
-    # 写入文件
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    output_path = os.path.join(OUTPUT_DIR, f"{date_str}.md")
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(report)
-
-    # 也更新 README 中的索引
-    update_index(date_str)
-
-    print(f"\n✅ 日报已生成: {output_path}")
-    print(f"📏 文件大小: {len(report)} 字符")
-
-
 def update_index(date_str: str):
-    """更新 daily/README.md 索引导航"""
     index_path = os.path.join(OUTPUT_DIR, "README.md")
     link = f"- [{date_str}]({date_str}.md)"
-
     existing = []
     if os.path.exists(index_path):
         with open(index_path) as f:
             existing = f.read().strip().split("\n")
-
     if link not in existing:
-        existing.insert(1, link)  # 插到标题后面
-
+        existing.append(link)
     with open(index_path, "w") as f:
         f.write("\n".join(existing) + "\n")
+
+
+def main():
+    now = datetime.datetime.utcnow()
+    date_str = now.strftime("%Y-%m-%d")
+    created_after = (now - datetime.timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+
+    print(f"🚀 ai-hardware-daily — {date_str}")
+    print(f"👀 只看 {created_after} 之后新建的仓库")
+    print("=" * 50)
+
+    results = {}
+    for category, query in SEARCH_QUERIES:
+        print(f"🔍 {category}...")
+        repos = search_new_repos(query, created_after, PER_QUERY)
+        results[category] = repos
+        print(f"   ✅ {len(repos)} 个")
+
+    report = generate_report(results, date_str, created_after)
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_path = os.path.join(OUTPUT_DIR, f"{date_str}.md")
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(report)
+    update_index(date_str)
+
+    print(f"\n✅ 日报生成: {output_path} ({len(report)} 字符)")
 
 
 if __name__ == "__main__":
